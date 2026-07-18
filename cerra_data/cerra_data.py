@@ -30,16 +30,25 @@ The layout written here is expected by cerra_extract.extract_all():
   Forecast variables (sub-daily accumulations, yearly files):
     <output_dir>/<variable_name>/<variable_name>_<year>.nc
 
+  Static fields (one-time download):
+    <output_dir>/orography/cerra_orography.nc  — model terrain elevation (m)
+
 VARIABLES DOWNLOADED
 --------------------
   Analysis (product_type="analysis"):
-    10m_wind_speed          — 10-m wind speed (si10, m/s), 8 times/day
-    2m_temperature          — 2-m air temperature (t2m, K), 8 times/day
-    2m_relative_humidity    — 2-m relative humidity (r2, %), 8 times/day
+    10m_wind_speed              — 10-m wind speed (si10, m/s), 8 times/day
+    2m_temperature              — 2-m air temperature (t2m, K), 8 times/day
+    2m_relative_humidity        — 2-m relative humidity (r2, %), 8 times/day
+    10m_wind_direction          — 10-m wind direction (wdir10, °), 8 times/day
+    NOTE: u10/v10 are NOT available in reanalysis-cerra-single-levels (neither as
+    analysis nor forecast).  cerra_extract.py derives them from si10 and wdir10.
 
   Forecast (product_type="forecast"):
     10m_wind_gust_since_previous_post_processing — wind gust (fg10, m/s)
     total_precipitation                          — precipitation accumulation (tp, m)
+
+  Static (one-time, product_type="analysis", single timestep):
+    orography — model terrain elevation (orog, m) — time-invariant
 
 REQUIREMENTS
 ------------
@@ -65,13 +74,16 @@ except ImportError as exc:
 DATASET = "reanalysis-cerra-single-levels"
 
 # Analysis-stream variables (3-hourly, 8 steps/day) stored in monthly files.
+# Wind direction is included so cerra_extract.py can derive u10/v10 from
+# si10 and wdir10; u10/v10 do not exist in reanalysis-cerra-single-levels.
 ANALYSIS_VARIABLES = [
     "10m_wind_speed",
     "2m_temperature",
     "2m_relative_humidity",
+    "10m_wind_direction",
 ]
 
-# Forecast-stream variables (accumulated/gust) stored as yearly files.
+# Forecast-stream variables stored as yearly files.
 FORECAST_VARIABLES = [
     "10m_wind_gust_since_previous_post_processing",
     "total_precipitation",
@@ -90,10 +102,6 @@ ANALYSIS_TIMES = [
 
 # Forecast initialisation time: 00:00 UTC (daily run).
 FORECAST_TIME = ["00:00"]
-# Lead times in hours requested for forecast variables.
-# CERRA forecasts run to 24 h from 00 UTC; gust and precip are available
-# at these lead times.  Lead time 24 h provides the next-day daily total
-# for precipitation (tp) and the maximum gust (fg10).
 LEADTIME_HOURS = ["1", "2", "3", "4", "5", "6", "9", "12", "15", "18", "21", "24"]
 
 
@@ -199,6 +207,52 @@ def download_forecast_variable_year(
     print(f"[DONE] {target_file}")
 
 
+def download_orography(
+    client: cdsapi.Client,
+    output_dir: Path,
+    overwrite: bool,
+    year: int = 1985,
+) -> None:
+    """
+    Download the CERRA model orography as a one-time static NetCDF.
+
+    The orography (terrain elevation in metres) is time-invariant; a single
+    analysis timestep is sufficient.  The file is written to:
+      <output_dir>/orography/cerra_orography.nc
+
+    This file is read by cerra_extract.extract_cerra_static() to compute the
+    delta_elev_m feature (target elevation − CERRA grid elevation) and to
+    derive CERRA-scale slope/aspect (northness, eastness) for each location.
+
+    Parameters
+    ----------
+    year : Any year within the CERRA archive (1984–2021). The orography is
+           identical across all years; 1985 is used by default.
+    """
+    orog_dir = output_dir / "orography"
+    orog_dir.mkdir(parents=True, exist_ok=True)
+    target_file = orog_dir / "cerra_orography.nc"
+
+    if target_file.exists() and not overwrite:
+        print(f"[SKIP] {target_file} already exists.")
+        return
+
+    request = {
+        "variable":     ["orography"],
+        "level_type":   "surface_or_atmosphere",
+        "data_type":    ["reanalysis"],
+        "product_type": "analysis",
+        "year":         [str(year)],
+        "month":        ["01"],
+        "day":          ["01"],
+        "time":         ["00:00"],
+        "data_format":  "netcdf",
+    }
+    print(f"[START] orography (static, year={year})")
+    client.retrieve(DATASET, request, str(target_file))
+    print(f"[DONE] {target_file}")
+
+
 def parse_args() -> argparse.Namespace:
     script_dir = Path(__file__).resolve().parent
 
@@ -231,6 +285,13 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     client = cdsapi.Client()
+
+    # Download the static orography once before the year loop.
+    print("━━ Downloading CERRA orography (static, one-time)")
+    try:
+        download_orography(client, output_dir, args.overwrite)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ERROR] orography: {exc}")
 
     failures: list[tuple[int, str, str]] = []
 

@@ -90,14 +90,14 @@ MIN_DAYS_FOR_COMPLETE_YEAR = 340
 _TIME_CODER = xr.coders.CFDatetimeCoder(use_cftime=True)
 
 
-def discover_members():
+def discover_members(input_dir):
     """
-    Scan INPUT_DIR for bias-corrected historical NetCDF files and return a
+    Scan input_dir for bias-corrected historical NetCDF files and return a
     list of (member_name, is_hadgem2) tuples sorted alphabetically.
 
     Files are expected to be named: <member>_bc_historical.nc
     """
-    pattern = os.path.join(cfg.INPUT_DIR, "*_bc_historical.nc")
+    pattern = os.path.join(input_dir, "*_bc_historical.nc")
     paths   = sorted(glob.glob(pattern))
     if not paths:
         raise FileNotFoundError(f"No files matching {pattern}")
@@ -110,18 +110,18 @@ def discover_members():
     ]
 
 
-def open_ds(member, scenario):
+def open_ds(member, scenario, input_dir):
     """Open one bias-corrected NetCDF file as an xarray Dataset."""
-    path = os.path.join(cfg.INPUT_DIR, f"{member}_bc_{scenario}.nc")
+    path = os.path.join(input_dir, f"{member}_bc_{scenario}.nc")
     return xr.open_dataset(path, decode_times=_TIME_CODER)
 
 
-def load_latlon():
+def load_latlon(input_dir):
     """
     Return (lons, lats) as float64 arrays from the first available
     bias-corrected historical NetCDF.  All members share the same Delos grid.
     """
-    first = sorted(glob.glob(os.path.join(cfg.INPUT_DIR, "*_bc_historical.nc")))[0]
+    first = sorted(glob.glob(os.path.join(input_dir, "*_bc_historical.nc")))[0]
     with xr.open_dataset(first) as ds:
         return (ds["lon"].values.astype(np.float64),
                 ds["lat"].values.astype(np.float64))
@@ -304,11 +304,18 @@ def main():
     parser = argparse.ArgumentParser(description="Postprocess bias-adjusted CORDEX NetCDF → CSV")
     parser.add_argument("--var", nargs="+", default=None,
                         help="Variable keys to process (default: all in plt_config.VARIABLES)")
+    parser.add_argument("--input-dir", default=None,
+                        help="Directory containing *_bc_*.nc files (default: cfg.INPUT_DIR)")
+    parser.add_argument("--output-dir", default=None,
+                        help="Directory for output ba_*.csv files (default: same as --input-dir)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Discover members and validate config, then exit without writing")
     args = parser.parse_args()
 
-    members = discover_members()
+    input_dir  = args.input_dir  if args.input_dir  else cfg.INPUT_DIR
+    output_dir = args.output_dir if args.output_dir else input_dir
+
+    members = discover_members(input_dir)
     print(f"Found {len(members)} ensemble members:")
     for name, is_hg in members:
         print(f"  {name}  [{'360-day' if is_hg else 'standard'} calendar]")
@@ -317,7 +324,7 @@ def main():
         print("\nDry run complete.")
         return
 
-    lons, lats = load_latlon()
+    lons, lats = load_latlon(input_dir)
     print(f"\nDomain  lon [{lons.min():.4f}, {lons.max():.4f}]  "
           f"lat [{lats.min():.4f}, {lats.max():.4f}]  points: {len(lons)}\n")
 
@@ -334,7 +341,7 @@ def main():
             member_thresholds = {}
             hist_arrays = []
             for member, is_hg in members:
-                ds    = open_ds(member, "historical")
+                ds    = open_ds(member, "historical", input_dir)
                 years = complete_years_in_period(ds, *HIST_PERIOD)
                 thr   = compute_r99p_threshold(ds, years)
                 member_thresholds[member] = thr
@@ -347,7 +354,7 @@ def main():
                 for yr_s, yr_e in FUTURE_PERIODS:
                     fut_arrays = []
                     for member, is_hg in members:
-                        ds    = open_ds(member, scen)
+                        ds    = open_ds(member, scen, input_dir)
                         years = complete_years_in_period(ds, yr_s, yr_e)
                         if not years:
                             fut_arrays.append(np.empty((0, len(lats))))
@@ -363,7 +370,7 @@ def main():
             # Standard statistics: process historical and all future periods uniformly
             hist_arrays = []
             for member, is_hg in members:
-                ds    = open_ds(member, "historical")
+                ds    = open_ds(member, "historical", input_dir)
                 years = complete_years_in_period(ds, *HIST_PERIOD)
                 arr   = (compute_annual_ai(ds, years)
                          if vcfg["stat_type"] == "aridity_index"
@@ -377,7 +384,7 @@ def main():
                 for yr_s, yr_e in FUTURE_PERIODS:
                     fut_arrays = []
                     for member, is_hg in members:
-                        ds    = open_ds(member, scen)
+                        ds    = open_ds(member, scen, input_dir)
                         years = complete_years_in_period(ds, yr_s, yr_e)
                         if not years:
                             fut_arrays.append(np.empty((0, len(lats))))
@@ -397,7 +404,8 @@ def main():
             for yr_s, yr_e in FUTURE_PERIODS:
                 row[_col(scen, yr_s, yr_e)] = results.get((scen, yr_s, yr_e))
 
-        out_path = os.path.join(cfg.INPUT_DIR, f"ba_{var_key}.csv")
+        os.makedirs(output_dir, exist_ok=True)
+        out_path = os.path.join(output_dir, f"ba_{var_key}.csv")
         pd.DataFrame(row).to_csv(out_path, index=False)
         print(f"  → saved: {out_path}\n")
 

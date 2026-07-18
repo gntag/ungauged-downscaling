@@ -1,0 +1,33 @@
+# Delos downscaling pipeline — Python dependencies
+# Install with:  pip install -r requirements.txt
+#
+# Versions are left unpinned; the pipeline targets Python >= 3.10
+# (config.py uses PEP 604 built-in generics such as list[str]).
+
+# --- Core numerics / data ---
+numpy
+pandas
+scipy
+
+# --- Machine learning ---
+lightgbm
+
+# --- NetCDF / Zarr I/O ---
+xarray
+zarr
+numcodecs
+netCDF4
+
+# --- Geospatial ---
+geopandas
+shapely
+rasterio          # raster/*.py DEM sampling, geo_features.py
+cartopy           # map projections in the plotting scripts
+
+# --- Plotting ---
+matplotlib
+pillow            # PIL — image handling in plot scripts
+
+# --- Data acquisition ---
+cdsapi            # Copernicus CDS API client (CERRA + land masks)
+requests          # HTTP downloads (raster/delos_mapzen_s2coast.py DEM tiles)

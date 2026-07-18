@@ -40,10 +40,18 @@ ANALYSIS vs FORECAST VARIABLES
 CERRA distinguishes two stream types, each with a different file layout:
 
   Analysis stream  — 3-hourly, stored in monthly files per year
-    t2m  : 2-m temperature (K)
-    r2   : 2-m relative humidity (%)
-    si10 : 10-m wind speed (m/s)
+    t2m    : 2-m temperature (K)
+    r2     : 2-m relative humidity (%)
+    si10   : 10-m wind speed (m/s)
+    wdir10 : 10-m wind direction (degrees true, FROM which wind blows)
     Each is aggregated to daily mean / min / max before merging.
+
+  Note: u10/v10 are NOT available in reanalysis-cerra-single-levels.
+  They are derived here from si10 and wdir10 after daily aggregation:
+    cerra_u10 = −cerra_wind × sin(cerra_wdir_rad)   (eastward, m/s)
+    cerra_v10 = −cerra_wind × cos(cerra_wdir_rad)   (northward, m/s)
+  The sign follows meteorological convention: wdir is the direction FROM
+  which the wind blows (0° = from North → southward flow → v10 < 0).
 
   Forecast stream  — sub-daily accumulations, stored in yearly files
     tp   : total precipitation (m) — accumulated to midnight; one value
@@ -86,9 +94,11 @@ _N_PATCH    = _PATCH_SIZE * _PATCH_SIZE   # = 16 grid cells per target
 # - unit_conversion_fn: applied element-wise to the raw array before aggregation
 # - daily_aggregations: which daily statistics to compute ("mean", "min", "max")
 _ANALYSIS_VARS = {
-    "t2m":  ("2m_temperature",       "t2m",  lambda x: x - _KELVIN_OFFSET, ["mean", "min", "max"]),
-    "r2":   ("2m_relative_humidity", "r2",   lambda x: x,                   ["mean"]),
-    "si10": ("10m_wind_speed",       "si10", lambda x: x,                   ["mean"]),
+    "t2m":  ("2m_temperature",       "t2m",    lambda x: x - _KELVIN_OFFSET, ["mean", "min", "max"]),
+    "r2":   ("2m_relative_humidity", "r2",     lambda x: x,                   ["mean"]),
+    "si10": ("10m_wind_speed",       "si10",   lambda x: x,                   ["mean"]),
+    # wdir10 is downloaded so u10/v10 can be derived; not exposed as an output column.
+    "wdir": ("10m_wind_direction",   "wdir10", lambda x: x,                   ["mean"]),
 }
 
 # Maps (short_key, aggregation) → output column name in the returned DataFrame
@@ -96,6 +106,7 @@ _ANALYSIS_OUT = {
     "t2m":  {"mean": "cerra_tmean", "min": "cerra_tmin", "max": "cerra_tmax"},
     "r2":   {"mean": "cerra_rh"},
     "si10": {"mean": "cerra_wind"},
+    "wdir": {"mean": "_cerra_wdir"},   # underscore prefix = internal; dropped after u10/v10 derivation
 }
 
 # ---------------------------------------------------------------------------
@@ -105,12 +116,15 @@ _ANALYSIS_OUT = {
 # tp   : total precipitation accumulated over the forecast period (m)
 # fg10 : maximum 10-m wind gust since the previous post-processing step (m/s)
 _FORECAST_VARS = {
-    "tp":   ("total_precipitation",                                   "tp"),
-    "fg10": ("10m_wind_gust_since_previous_post_processing", "fg10"),
+    "tp":   ("total_precipitation",                                   "tp",   "daily_total"),
+    "fg10": ("10m_wind_gust_since_previous_post_processing", "fg10",  "daily_max"),
 }
 
 # Output column names for forecast variables in the returned DataFrame
-_FORECAST_OUT = {"tp": "cerra_precip", "fg10": "cerra_gust"}
+_FORECAST_OUT = {
+    "tp":   "cerra_precip",
+    "fg10": "cerra_gust",
+}
 
 # Module-level LSM cache: populated on the first call to _load_lsm()
 _lsm_cache: np.ndarray | None = None
@@ -140,29 +154,36 @@ def extract_all(
     locations: pd.DataFrame,
     year_start: int,
     year_end: int,
+    nearest_cell: bool = False,
 ) -> pd.DataFrame:
     """
     Extract daily CERRA values at every location for all years in [year_start, year_end].
 
     Parameters
     ----------
-    cerra_dir  : Root CERRA data directory.  Expected layout:
-                   <cerra_dir>/<subfolder>/<year>/<month>.nc  (analysis)
-                   <cerra_dir>/<subfolder>/<var>_<year>.nc    (forecast)
-    locations  : DataFrame with columns: id, lat, lon.
-    year_start : First year to extract (inclusive).
-    year_end   : Last year to extract (inclusive).
+    cerra_dir    : Root CERRA data directory.  Expected layout:
+                     <cerra_dir>/<subfolder>/<year>/<month>.nc  (analysis)
+                     <cerra_dir>/<subfolder>/<var>_<year>.nc    (forecast)
+    locations    : DataFrame with columns: id, lat, lon.
+    year_start   : First year to extract (inclusive).
+    year_end     : Last year to extract (inclusive).
+    nearest_cell : If True, use nearest-grid-cell lookup instead of cubic
+                   CloughTocher2D patch interpolation.  Same LSM-aware island
+                   patching and precipitation date-shift logic as the default
+                   interpolation path; only the spatial extraction differs.
+                   Use this for a nearest-cell CERRA baseline (no smoothing).
 
     Returns
     -------
     Long-format DataFrame with columns:
       id, date, cerra_tmean, cerra_tmin, cerra_tmax, cerra_rh, cerra_wind,
-      cerra_precip, cerra_gust
+      cerra_u10, cerra_v10, cerra_precip, cerra_gust
     One row per (location id, calendar day).
+    cerra_u10/v10 are derived from cerra_wind × wdir10 (see module docstring).
 
     IMPLEMENTATION NOTES
     --------------------
-    Interpolation is performed in four stages:
+    Interpolation (nearest_cell=False) is performed in four stages:
       1. Load the CERRA grid lat/lon arrays from one sample NetCDF.
       2. Precompute per-target patches and Delaunay triangulations once.
       3. Compute the global sub-region bounding box to minimise array reads.
@@ -175,7 +196,7 @@ def extract_all(
     lat2d, lon2d = _load_grid(sample)
     ny, nx = lat2d.shape
 
-    # --- Stage 2: precompute per-target patch and Delaunay triangulation ----
+    # --- Stage 2: precompute per-target spatial lookup ----------------------
     target_ll = locations[["lat", "lon"]].values   # (N_locs, 2)
 
     # Load the CERRA LSM if available; if the file is missing, all targets
@@ -183,18 +204,32 @@ def extract_all(
     from downscaling.config import LSM_PATH
     is_land_flat = _load_lsm(LSM_PATH) if LSM_PATH.exists() else None
 
-    # patch_info: list of (row_indices, col_indices, Delaunay, target) per location
-    patch_info = _precompute_patches(lat2d, lon2d, target_ll, is_land_flat)
+    loc_ids = locations["id"].values
 
-    # --- Stage 3: compute the minimal bounding sub-region -------------------
-    # Reading only the rows y_min:y_max and columns x_min:x_max from each
-    # NetCDF file (instead of the entire ~5k×5k grid) reduces I/O by ~99 %.
-    y_min, y_max, x_min, x_max = _patch_bbox(patch_info, ny, nx)
+    if nearest_cell:
+        # Nearest-cell mode: single-cell lookup per location, tri=None signals
+        # _interpolate_subregion to use direct array indexing (no CloughTocher2D).
+        nn_rows, nn_cols = _find_nearest_cells(lat2d, lon2d, target_ll, is_land_flat)
+        y_min = int(nn_rows.min())
+        y_max = int(nn_rows.max()) + 1
+        x_min = int(nn_cols.min())
+        x_max = int(nn_cols.max()) + 1
+        rel_info = [
+            (np.array([r - y_min]), np.array([c - x_min]), None, np.array([lat, lon]))
+            for (r, c), (lat, lon) in zip(zip(nn_rows, nn_cols), target_ll)
+        ]
+    else:
+        # patch_info: list of (row_indices, col_indices, Delaunay, target) per location
+        patch_info = _precompute_patches(lat2d, lon2d, target_ll, is_land_flat)
 
-    # Convert absolute grid indices to relative indices within the sub-region
-    # so _interpolate_subregion() can index directly into the sub-array.
-    rel_info = [(rows - y_min, cols - x_min, tri, tgt) for rows, cols, tri, tgt in patch_info]
-    loc_ids  = locations["id"].values
+        # --- Stage 3: compute the minimal bounding sub-region ---------------
+        # Reading only the rows y_min:y_max and columns x_min:x_max from each
+        # NetCDF file (instead of the entire ~5k×5k grid) reduces I/O by ~99 %.
+        y_min, y_max, x_min, x_max = _patch_bbox(patch_info, ny, nx)
+
+        # Convert absolute grid indices to relative indices within the sub-region
+        # so _interpolate_subregion() can index directly into the sub-array.
+        rel_info = [(rows - y_min, cols - x_min, tri, tgt) for rows, cols, tri, tgt in patch_info]
 
     # --- Stage 4: extract year by year and concatenate ----------------------
     yearly = []
@@ -344,16 +379,54 @@ def _patch_bbox(
     return max(0, y_min), min(ny, y_max), max(0, x_min), min(nx, x_max)
 
 
+def _find_nearest_cells(
+    lat2d: np.ndarray,
+    lon2d: np.ndarray,
+    target_latlons: np.ndarray,
+    is_land_flat: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Find the nearest CERRA grid cell for each target location.
+
+    When is_land_flat is provided and the nearest cell is a sea cell, the
+    nearest land cell is used instead (LSM-aware island patching, same logic as
+    _precompute_patches).
+
+    Returns (nn_rows, nn_cols) integer arrays of shape (N_targets,).
+    """
+    ny, nx    = lat2d.shape
+    cos_lat   = np.cos(np.radians(float(np.mean(lat2d))))
+    tree      = KDTree(np.column_stack([lat2d.ravel(), lon2d.ravel() * cos_lat]))
+    nn_rows   = np.empty(len(target_latlons), dtype=int)
+    nn_cols   = np.empty(len(target_latlons), dtype=int)
+
+    for i, (lat, lon) in enumerate(target_latlons):
+        q        = [lat, lon * cos_lat]
+        _, idx   = tree.query(q)
+        if is_land_flat is not None and not bool(is_land_flat[idx]):
+            k       = min(500, ny * nx)
+            _, cands = tree.query(q, k=k)
+            land    = cands[is_land_flat[cands]]
+            idx     = int(land[0]) if len(land) > 0 else int(idx)
+        r, c = np.unravel_index(int(idx), (ny, nx))
+        nn_rows[i], nn_cols[i] = r, c
+
+    return nn_rows, nn_cols
+
+
 def _interpolate_subregion(
     data: np.ndarray,
     rel_rows: np.ndarray,
     rel_cols: np.ndarray,
-    tri: Delaunay,
+    tri: Delaunay | None,
     target: np.ndarray,
 ) -> np.ndarray:
     """
-    Evaluate a spatially varying field at one target location using cubic
-    interpolation over a precomputed Delaunay triangulation.
+    Evaluate a spatially varying field at one target location.
+
+    When tri is None (nearest-cell mode), returns data[:, rel_rows[0], rel_cols[0]]
+    directly.  Otherwise evaluates using cubic CloughTocher2D interpolation over
+    a precomputed Delaunay triangulation.
 
     Parameters
     ----------
@@ -377,6 +450,10 @@ def _interpolate_subregion(
     extrapolation).  The cosine scaling applied to the longitude axis
     ensures the distance metric is approximately equidistant.
     """
+    if tri is None:
+        # Nearest-cell mode: single cell index, no interpolation needed.
+        return data[:, int(rel_rows[0]), int(rel_cols[0])].copy()
+
     # Extract patch values for all T time steps: (T, N_patch_cells)
     patch_flat = data[:, rel_rows, rel_cols]
 
@@ -441,7 +518,21 @@ def _extract_analysis_year(
         for agg in agg_methods:
             col     = _ANALYSIS_OUT[nc_key][agg]
             grouped = df_wide.groupby(df_wide.index)
-            if agg == "mean":
+            if nc_key == "wdir" and agg == "mean":
+                # Circular mean: average sin/cos components then reconstruct.
+                # Arithmetic mean of raw degrees is wrong for northerly winds
+                # (e.g. 350° and 10° → mean 180° instead of 0°).
+                rad       = np.radians(df_wide.values)
+                sin_df    = pd.DataFrame(np.sin(rad), index=dates, columns=loc_ids)
+                cos_df    = pd.DataFrame(np.cos(rad), index=dates, columns=loc_ids)
+                sin_daily = sin_df.groupby(sin_df.index).mean()
+                cos_daily = cos_df.groupby(cos_df.index).mean()
+                daily     = pd.DataFrame(
+                    np.degrees(np.arctan2(sin_daily.values, cos_daily.values)),
+                    index=sin_daily.index,
+                    columns=sin_daily.columns,
+                )
+            elif agg == "mean":
                 daily = grouped.mean()
             elif agg == "min":
                 daily = grouped.min()
@@ -458,8 +549,18 @@ def _extract_analysis_year(
         return pd.DataFrame(columns=["id", "date"])
 
     # Combine all variables on the shared (id, date) index.
-    # axis=1 join ensures no row duplication — each chunk contributes one column.
-    return pd.concat(chunks, axis=1).reset_index()
+    result = pd.concat(chunks, axis=1).reset_index()
+
+    # Derive u10/v10 from wind speed and direction.
+    # Meteorological convention: wdir is the direction FROM which wind blows,
+    # measured clockwise from north → u = −si10·sin(wdir), v = −si10·cos(wdir).
+    if "cerra_wind" in result.columns and "_cerra_wdir" in result.columns:
+        wdir_rad = np.radians(result["_cerra_wdir"])
+        result["cerra_u10"] = -result["cerra_wind"] * np.sin(wdir_rad)
+        result["cerra_v10"] = -result["cerra_wind"] * np.cos(wdir_rad)
+        result = result.drop(columns=["_cerra_wdir"])
+
+    return result
 
 
 def _read_analysis_variable(
@@ -547,7 +648,7 @@ def _extract_forecast_year(
     """
     chunks: list[pd.DataFrame] = []
 
-    for nc_key, (folder, var_name) in _FORECAST_VARS.items():
+    for nc_key, (folder, var_name, agg) in _FORECAST_VARS.items():
         fpath = Path(cerra_dir) / folder / f"{folder}_{year}.nc"
         if not fpath.exists():
             continue
@@ -567,14 +668,16 @@ def _extract_forecast_year(
         )
 
         col = _FORECAST_OUT[nc_key]
-        if nc_key == "tp":
+        if agg == "daily_total":
             # Keep only the 00:00 Z step; shift date back by one day.
             mask    = valid_times.hour == 0
             dates   = (valid_times[mask] - pd.Timedelta(days=1)).normalize()
             df_wide = pd.DataFrame(values[mask], index=dates, columns=loc_ids)
-        else:
-            # Daily maximum: group by forecast init day, take the max over lead times.
+        elif agg == "daily_max":
             dates, vals2d = _daily_max_from_forecast(valid_times, values)
+            df_wide = pd.DataFrame(vals2d, index=dates, columns=loc_ids)
+        else:  # daily_mean
+            dates, vals2d = _daily_mean_from_forecast(valid_times, values)
             df_wide = pd.DataFrame(vals2d, index=dates, columns=loc_ids)
 
         df_wide.index.name = "date"
@@ -631,3 +734,145 @@ def _daily_max_from_forecast(
     # 2-D case: (T, N_locs) → (N_days, N_locs)
     daily = pd.DataFrame(values, index=idx).groupby(level=0).max()
     return pd.DatetimeIndex(daily.index), daily.values
+
+
+def _daily_mean_from_forecast(
+    valid_times: pd.DatetimeIndex,
+    values: np.ndarray,
+) -> tuple[pd.DatetimeIndex, np.ndarray]:
+    """
+    Aggregate sub-daily forecast values to daily mean.
+
+    Uses the same date-assignment logic as _daily_max_from_forecast: steps at
+    00:00 Z are attributed to the previous calendar day.
+    """
+    init_dates = np.where(
+        valid_times.hour != 0,
+        valid_times.floor("D").values,
+        (valid_times - pd.Timedelta(days=1)).floor("D").values,
+    )
+    idx = pd.DatetimeIndex(init_dates)
+
+    if values.ndim == 1:
+        daily = pd.Series(values, index=idx).groupby(level=0).mean()
+        return pd.DatetimeIndex(daily.index), daily.values
+
+    daily = pd.DataFrame(values, index=idx).groupby(level=0).mean()
+    return pd.DatetimeIndex(daily.index), daily.values
+
+
+# ---------------------------------------------------------------------------
+# Static CERRA terrain features (orography-derived, time-invariant)
+# ---------------------------------------------------------------------------
+
+def extract_cerra_static(
+    cerra_dir: Path,
+    locations: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Compute per-location static features derived from the CERRA model orography.
+
+    Features returned
+    -----------------
+    cerra_elev_m    : CERRA terrain elevation (m) at each location, estimated as
+                      the mean of the 4×4 interpolation patch cells.  Used to
+                      compute delta_elev_m = target_elevation - cerra_elev_m.
+
+    cerra_northness : cos(terrain_aspect) from the CERRA orography gradient.
+                      +1 = north-facing slope, −1 = south-facing slope.
+                      Encodes differential solar radiation and Meltemi exposure.
+
+    cerra_eastness  : sin(terrain_aspect) from the CERRA orography gradient.
+                      +1 = east-facing slope, −1 = west-facing slope.
+
+    Parameters
+    ----------
+    cerra_dir : Root CERRA data directory; must contain
+                orography/cerra_orography.nc downloaded by cerra_data.py.
+    locations : DataFrame with columns: id, lat, lon.
+
+    Returns
+    -------
+    DataFrame with columns: id, cerra_elev_m, cerra_northness, cerra_eastness.
+    If the orography file is absent, returns a DataFrame of zeros for graceful
+    degradation (the pipeline can still run without delta-elevation correction).
+    """
+    orog_path = Path(cerra_dir) / "orography" / "cerra_orography.nc"
+
+    if not orog_path.exists():
+        import warnings
+        warnings.warn(
+            f"CERRA orography not found at {orog_path}. "
+            "cerra_elev_m, cerra_northness, cerra_eastness will be zero. "
+            "Run cerra_data.py to download the orography.",
+            stacklevel=2,
+        )
+        n = len(locations)
+        return pd.DataFrame({
+            "id":               locations["id"].values,
+            "cerra_elev_m":    np.zeros(n, dtype=np.float32),
+            "cerra_northness": np.zeros(n, dtype=np.float32),
+            "cerra_eastness":  np.zeros(n, dtype=np.float32),
+        })
+
+    with xr.open_dataset(orog_path, engine="netcdf4") as ds:
+        # CERRA stores orography as 'orog' in metres (time-invariant; drop time dim)
+        orog_var = next(v for v in ("orog", "z", "orography") if v in ds)
+        orog2d   = ds[orog_var].values
+        # Handle a leading time dimension if present (take first slice)
+        if orog2d.ndim == 3:
+            orog2d = orog2d[0]
+        orog2d   = orog2d.astype(np.float32)
+        # If geopotential (J/kg) is stored instead of metres, divide by g
+        if orog2d.max() > 10_000:
+            orog2d /= 9.80665
+        lat2d = ds["latitude"].values
+        lon2d = ds["longitude"].values
+
+    ny, nx = lat2d.shape
+    cos_lat = np.cos(np.radians(float(np.mean(lat2d))))
+    tree    = KDTree(np.column_stack([lat2d.ravel(), lon2d.ravel() * cos_lat]))
+
+    # Pixel spacing in degrees (approximate) for gradient scaling
+    dlat = np.abs(float(np.mean(np.diff(lat2d[:, 0]))))
+    dlon = np.abs(float(np.mean(np.diff(lon2d[0, :]))))
+    # Convert to approximate metres at the domain mean latitude
+    dy_m = dlat * 111_320.0
+    dx_m = dlon * 111_320.0* cos_lat
+
+    # Gradient of the CERRA orography in metres-per-metre
+    # np.gradient returns (d/drow, d/dcol); rows increase southward so
+    # the northward gradient is -d/drow.
+    grad_row, grad_col = np.gradient(orog2d)
+    dz_dy_north =  -grad_row / dy_m   # northward slope (m/m)
+    dz_dx_east  =   grad_col / dx_m   # eastward slope  (m/m)
+
+    # Aspect measured clockwise from north; arctan2(east, north) convention
+    aspect = np.arctan2(dz_dx_east, dz_dy_north)
+    northness_2d = np.cos(aspect).astype(np.float32)
+    eastness_2d  = np.sin(aspect).astype(np.float32)
+
+    target_ll = locations[["lat", "lon"]].values
+    half = _PATCH_SIZE // 2
+
+    records = []
+    for loc_id, (lat, lon) in zip(locations["id"].values, target_ll):
+        q = [lat, lon * cos_lat]
+        _, flat_idx = tree.query(q)
+        y0, x0 = np.unravel_index(flat_idx, (ny, nx))
+
+        y_start = max(0, y0 - half);  y_end = min(ny, y_start + _PATCH_SIZE)
+        x_start = max(0, x0 - half);  x_end = min(nx, x_start + _PATCH_SIZE)
+
+        patch_elev      = orog2d[y_start:y_end, x_start:x_end]
+        patch_northness = northness_2d[y_start:y_end, x_start:x_end]
+        patch_eastness  = eastness_2d[y_start:y_end, x_start:x_end]
+
+        records.append({
+            "id":               loc_id,
+            "cerra_elev_m":    float(np.nanmean(patch_elev)),
+            "cerra_northness": float(np.nanmean(patch_northness)),
+            "cerra_eastness":  float(np.nanmean(patch_eastness)),
+        })
+
+    return pd.DataFrame(records)

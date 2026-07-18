@@ -370,3 +370,149 @@ def apply_eqm_grid(
         result[:, p] = r
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Seasonal precipitation EQM (DOY-window transfer with fallback)
+# ---------------------------------------------------------------------------
+
+def _circular_doy_dist(a: np.ndarray, b: int, cal_len: int = 366) -> np.ndarray:
+    """Circular distance (days) between DOY array a and a scalar DOY b."""
+    d = np.abs(a - b)
+    return np.minimum(d, cal_len - d)
+
+
+def seasonal_precip_eqm(
+    target_pred: np.ndarray,
+    target_doy: np.ndarray,
+    donor_obs: np.ndarray,
+    donor_pred: np.ndarray,
+    donor_doy: np.ndarray,
+    window_days: int = 45,
+    step_days: int = 30,
+    min_wet: int = 30,
+    n_quantiles: int = 200,
+    wet_threshold: float = 0.1,
+) -> np.ndarray:
+    """
+    Season-aware EQM correction of a precipitation series.
+
+    A separate transfer function is fitted at fixed DOY centres spaced
+    ``step_days`` apart, each from donor (obs, pred) pairs within a circular
+    ±``window_days`` window.  If a window has fewer than ``min_wet`` wet donor
+    days, it falls back to the full-season donor sample so the transfer stays
+    stable in sparse seasons (e.g. Mediterranean summer).
+
+    Each target day is corrected with the transfer of the nearest DOY centre.
+    This gives smooth seasonal variation while bounding the number of fits.
+
+    Parameters
+    ----------
+    target_pred : (n,) model best-estimate precip to correct
+    target_doy  : (n,) day-of-year (1..366) for each target day
+    donor_obs   : (m,) observed precip from donor stations
+    donor_pred  : (m,) model best-estimate precip from donor stations
+    donor_doy   : (m,) day-of-year for each donor sample
+    window_days : half-width of the circular DOY window for donor selection
+    step_days   : spacing between DOY centres (30 → 12 windows)
+    min_wet     : minimum wet donor days in a window before falling back
+    n_quantiles : quantile levels for the empirical CDF
+    wet_threshold : wet-day threshold (mm)
+
+    Returns
+    -------
+    (n,) corrected precip, NaN preserved where target_pred is NaN.
+    """
+    target_pred = np.asarray(target_pred, dtype=float)
+    target_doy  = np.asarray(target_doy)
+    donor_obs   = np.asarray(donor_obs, dtype=float)
+    donor_pred  = np.asarray(donor_pred, dtype=float)
+    donor_doy   = np.asarray(donor_doy)
+
+    # Fallback transfer from the full-season donor pool (used for sparse windows)
+    full_transfer = fit_eqm(donor_obs, donor_pred, n_quantiles=n_quantiles,
+                            is_precip=True, wet_threshold=wet_threshold)
+
+    centres = np.arange(1, 367, step_days)
+    # Precompute one transfer per centre
+    centre_transfers = {}
+    donor_wet = donor_obs > wet_threshold
+    for c in centres:
+        in_win = _circular_doy_dist(donor_doy, int(c)) <= window_days
+        if int((in_win & donor_wet).sum()) >= min_wet:
+            centre_transfers[c] = fit_eqm(
+                donor_obs[in_win], donor_pred[in_win],
+                n_quantiles=n_quantiles, is_precip=True,
+                wet_threshold=wet_threshold,
+            )
+        else:
+            centre_transfers[c] = full_transfer
+
+    # Assign each target day to the nearest centre and apply that transfer
+    result = np.full_like(target_pred, np.nan)
+    nearest = centres[np.argmin(
+        np.stack([_circular_doy_dist(target_doy, int(c)) for c in centres], axis=1),
+        axis=1,
+    )]
+    for c in centres:
+        sel = nearest == c
+        if np.any(sel):
+            result[sel] = apply_eqm(target_pred[sel], centre_transfers[c], is_precip=True)
+    return result
+
+
+def blended_precip_eqm(
+    target_cerra: np.ndarray,
+    target_src: np.ndarray,
+    target_doy: np.ndarray,
+    donor_obs: np.ndarray,
+    donor_cerra: np.ndarray,
+    donor_doy: np.ndarray,
+    alpha: float = 0.6,
+    window_days: int = 45,
+    step_days: int = 30,
+    min_wet: int = 30,
+    n_quantiles: int = 200,
+    wet_threshold: float = 0.1,
+) -> np.ndarray:
+    """
+    Final precipitation estimate that fixes both totals/extremes AND monthly R².
+
+        precip = alpha · QM_seasonal(CERRA → obs) + (1 − alpha) · target_src
+
+    Rationale
+    ---------
+    Frequency-anchored EQM restores the marginal distribution (totals, extreme
+    frequency) but *reassigns* daily intensities by a weak model rank, which
+    destroys month-to-month correlation (monthly R² goes negative).
+
+    Interpolation-based quantile mapping (seasonal_precip_eqm) instead *scales*
+    each value monotonically through the CERRA→obs transfer, preserving CERRA's
+    real day-matched timing (CERRA has positive monthly R²).  Blending this with
+    the model best-estimate (occ × mean) adds the sub-grid spatial structure that
+    CERRA lacks, and — because the two error sources are partially independent —
+    lifts monthly R² above either component alone.
+
+    Parameters
+    ----------
+    target_cerra : (n,) CERRA precip at the target location (mm) — QM input & ranker
+    target_src   : (n,) model best-estimate occ_prob × precip_mean (mm)
+    target_doy   : (n,) day-of-year (1..366)
+    donor_obs    : (m,) observed precip from donor stations (mm)
+    donor_cerra  : (m,) CERRA precip paired with donor_obs (same rows)
+    donor_doy    : (m,) day-of-year for each donor sample
+    alpha        : blend weight on the QM-corrected CERRA term (0..1)
+
+    Returns
+    -------
+    (n,) non-negative blended precip; NaN where target_cerra is NaN.
+    """
+    qm_cerra = seasonal_precip_eqm(
+        target_cerra, target_doy,
+        donor_obs, donor_cerra, donor_doy,
+        window_days=window_days, step_days=step_days,
+        min_wet=min_wet, n_quantiles=n_quantiles, wet_threshold=wet_threshold,
+    )
+    src = np.asarray(target_src, dtype=float)
+    blended = alpha * qm_cerra + (1.0 - alpha) * src
+    return np.clip(blended, 0.0, None)

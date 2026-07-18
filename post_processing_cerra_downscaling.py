@@ -301,7 +301,10 @@ def write_daily_values(source: zarr.Group, output_path: Path) -> zarr.Group:
 
     daily = zarr.open(str(output_path), mode="w")
     daily.attrs["source_zarr"]           = str(POSTPROCESS_SOURCE_ZARR)
-    daily.attrs["precip_mm_definition"]  = "precip_occurrence_prob * precip_p50"
+    daily.attrs["precip_mm_definition"]  = (
+        "precip_best_eqm (frequency-anchored EQM) if present, "
+        "else precip_occurrence_prob * E[P|wet]"
+    )
 
     # --- Coordinate variables ------------------------------------------------
     create_1d_dataset(daily, "time", time, "int64", min(n_times, _ZARR_CHUNKS[0]))
@@ -333,21 +336,30 @@ def write_daily_values(source: zarr.Group, output_path: Path) -> zarr.Group:
             "_ARRAY_DIMENSIONS":   ["time", "point"],
         })
 
-    # --- Precipitation: two-part model → expected daily total ----------------
-    require_array(source, "precip_occurrence_prob")
-    require_array(source, "precip_p50")
-    require_array(source, "precip_p90")
-
-    # E[P] = P(wet) × E[P | wet], where E[P | wet] is gamma-fitted from p50/p90.
-    precip = (
-        source["precip_occurrence_prob"][:]
-        * _gamma_conditional_mean(source["precip_p50"][:], source["precip_p90"][:])
-    ).astype("float32")
+    # --- Precipitation: final daily total ------------------------------------
+    # Prefer the frequency-anchored EQM correction (precip_best_eqm) written by
+    # predict.py — it restores annual totals and extreme frequency that the raw
+    # two-part model compresses.  Fall back to the two-part expected value
+    # E[P] = P(wet) × E[P | wet] when EQM output is not present in the source.
+    if "precip_best_eqm" in source:
+        precip = np.asarray(source["precip_best_eqm"][:], dtype="float32")
+        precip = np.nan_to_num(precip, nan=0.0)
+        precip_def = "precip_best_eqm (frequency-anchored EQM correction)"
+    else:
+        require_array(source, "precip_occurrence_prob")
+        require_array(source, "precip_p50")
+        require_array(source, "precip_p90")
+        precip = (
+            source["precip_occurrence_prob"][:]
+            * _gamma_conditional_mean(source["precip_p50"][:], source["precip_p90"][:])
+        ).astype("float32")
+        precip_def = "precip_occurrence_prob * E[P | wet] (gamma-fitted from p50/p90)"
 
     create_2d_dataset(daily, "precip_mm", precip, data_chunks)
     daily["precip_mm"].attrs.update({
         "units":             _PRECIP_UNITS,
         "long_name":         _PRECIP_LONG_NAME,
+        "definition":        precip_def,
         "_ARRAY_DIMENSIONS": ["time", "point"],
     })
 
