@@ -269,8 +269,8 @@ preserve changes in quantiles and extremes?**
 Cannon A. J., Sobie S. R. & Murdock T. Q. (2015). *Journal of Climate*, 28, 6938–6959.
 https://doi.org/10.1175/JCLI-D-14-00754.1
 
-Quantile delta mapping and the preservation of extremes under quantile mapping;
-context for correcting the >20/>50 mm tail without distorting the marginal distribution.
+Comparison of quantile-mapping methods and preservation of changes in extremes;
+methodological context for evaluating the >20/>50 mm tail.
 
 ---
 

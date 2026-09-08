@@ -5,9 +5,9 @@ Empirical Quantile Mapping (EQM) bias correction — core library.
 
 SCIENTIFIC BASIS
 ----------------
-EQM (also called EDCDF or quantile delta mapping in the literature) maps each
-quantile of a model's distribution to the corresponding quantile of the
-observed distribution, estimated from the historical calibration period.
+The method maps each quantile of a model's distribution to the corresponding
+quantile of the observed distribution, estimated from the historical
+calibration period.
 
 The transfer function T(x) is:
     T(x) = Q_obs(F_mdl(x))
